@@ -345,15 +345,24 @@ fn answer<O: Ops>(
     if ids.is_empty() {
         anyhow::bail!("the prompt is empty");
     }
+    let chosen = p.think.map(|t| model.cfg.think_loops(t)).or(loops);
+    let loops = model.cfg.loops(chosen)?;
+    // Every loop has its own state, so another level cannot continue from this one.
     let new_tokens = match cache {
-        Some(c) if ids.len() > c.tokens.len() && ids.starts_with(&c.tokens) => c.tokens.len(),
+        Some(c)
+            if c.session.loops == loops
+                && ids.len() > c.tokens.len()
+                && ids.starts_with(&c.tokens) =>
+        {
+            c.tokens.len()
+        }
         _ => 0,
     };
     if new_tokens == 0 {
         // Dropped first, so the old state is gone before the new one is allocated.
         *cache = None;
         *cache = Some(Kept {
-            session: model.session(loops)?,
+            session: model.session(Some(loops))?,
             tokens: Vec::new(),
         });
     }

@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use slm::api::Defaults;
+use slm::config::{Config, Think};
 use slm::cpu::Cpu;
 use slm::model::{Model, Session, CHUNK};
 use slm::ops::Ops;
@@ -48,9 +49,19 @@ struct Common {
     /// Thinking loops per token; more are slower. Defaults to the model's own value
     #[arg(short = 'R', long)]
     loops: Option<usize>,
+    /// Thinking level, which picks the loops; higher reasons further and runs slower
+    #[arg(long, value_enum, conflicts_with = "loops")]
+    think: Option<Think>,
     /// Use 16-bit floats on MLX, which halves the decode state
     #[arg(long)]
     fp16: bool,
+}
+
+impl Common {
+    /// The loops asked for on the command line, if any.
+    fn loops(&self, cfg: &Config) -> Option<usize> {
+        self.think.map(|t| cfg.think_loops(t)).or(self.loops)
+    }
 }
 
 #[derive(Args, Clone)]
@@ -207,7 +218,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
         } => {
             let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
-            let mut se = model.session(common.loops)?;
+            let mut se = model.session(common.loops(&model.cfg))?;
             let mut history = encode(&tk, &prompt)?;
             if history.is_empty() {
                 bail!("the prompt is empty");
@@ -235,7 +246,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
         Cmd::Repl { common, gen } => {
             let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
-            let mut se = model.session(common.loops)?;
+            let mut se = model.session(common.loops(&model.cfg))?;
             let mut history = Vec::new();
             let mut rng = Rng::new(gen.seed);
             eprintln!(
@@ -306,7 +317,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
                     max_tokens: gen.max_tokens,
                     sampling: sampling(&gen),
                 },
-                loops: common.loops,
+                loops: common.loops(&model.cfg),
                 seed: gen.seed,
             };
             serve::run(model, tk, options)?;
@@ -327,6 +338,13 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
             println!(
                 "loops:      default {}, max {}",
                 c.default_loops, c.max_loops
+            );
+            println!(
+                "thinking:   low {}, medium {}, high {}, max {}",
+                c.think_loops(Think::Low),
+                c.think_loops(Think::Medium),
+                c.think_loops(Think::High),
+                c.think_loops(Think::Max)
             );
         }
         Cmd::Verify { common } => {

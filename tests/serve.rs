@@ -183,6 +183,44 @@ fn a_chat_can_continue_from_its_last_answer() {
 }
 
 #[test]
+fn reasoning_effort_sets_the_loops_of_one_request() {
+    let s = start(&[]);
+    let plain = json!({ "prompt": "Hello", "max_tokens": 6, "seed": 1, "temperature": 0.0 });
+    let mut high = plain.clone();
+    high["reasoning_effort"] = json!("high");
+
+    let (_, deep) = post(&s, "/v1/completions", high);
+    let started_high = start(&["--think", "high"]);
+    let (_, same) = post(&started_high, "/v1/completions", plain.clone());
+    assert_eq!(deep["choices"][0]["text"], same["choices"][0]["text"]);
+
+    // The request above must not leave the server at that level.
+    let (_, after) = post(&s, "/v1/completions", plain.clone());
+    let (_, fresh) = post(&start(&[]), "/v1/completions", plain);
+    assert_eq!(after["choices"][0]["text"], fresh["choices"][0]["text"]);
+    assert_ne!(deep["choices"][0]["text"], after["choices"][0]["text"]);
+
+    let bad = json!({ "prompt": "Hello", "reasoning_effort": "huge" });
+    assert_eq!(post(&s, "/v1/completions", bad).0, 400);
+}
+
+#[test]
+fn another_level_does_not_continue_the_last_state() {
+    let s = start(&[]);
+    let first = json!({ "prompt": "Hello", "max_tokens": 4, "temperature": 0.0, "reasoning_effort": "low" });
+    let (_, one) = post(&s, "/v1/completions", first);
+    let text = one["choices"][0]["text"].as_str().unwrap().to_owned();
+    let longer = json!({
+        "prompt": format!("Hello{text} more"), "max_tokens": 4, "temperature": 0.0,
+        "reasoning_effort": "max",
+    });
+    let (status, two) = post(&s, "/v1/completions", longer.clone());
+    assert_eq!(status, 200, "{two}");
+    let (_, three) = post(&start(&[]), "/v1/completions", longer);
+    assert_eq!(two["choices"][0]["text"], three["choices"][0]["text"]);
+}
+
+#[test]
 fn errors_use_the_openai_shape() {
     let s = start(&[]);
     let (status, reply) = post(&s, "/v1/completions", json!({ "max_tokens": 1 }));

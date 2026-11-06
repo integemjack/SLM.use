@@ -28,6 +28,7 @@ python tools/convert.py runs/g86-f/model.pt model --tokenizer data/pretrain/toke
 
 ```bash
 slm run "集中采购和分散采购的区别是" -m model -n 200
+slm run "集中采购和分散采购的区别是" -m model --think high
 slm repl -m model
 slm bench -m model
 slm info -m model
@@ -39,7 +40,8 @@ slm info -m model
 |---|---|---|
 | `-m, --model` | 模型目录 | `model` |
 | `-d, --device` | `auto`、`cuda`、`mlx`、`cpu` | `auto` |
-| `-R, --loops` | 每个 token 循环几轮，越多越慢 | 模型配置里的值 |
+| `--think` | 思考档位：`low`、`medium`、`high`、`max`，不能和 `-R` 同时用 | `medium` |
+| `-R, --loops` | 直接指定每个 token 循环几轮，越多越慢 | 模型配置里的值 |
 | `-n, --max-tokens` | 最多生成多少 token | 256 |
 | `-t, --temperature` | 采样温度，0 表示总取概率最大的 | 0.8 |
 | `--top-k` | 只从概率最高的 k 个里采样 | 40 |
@@ -49,6 +51,30 @@ slm info -m model
 | `--fp16` | MLX 上用 16 位浮点，解码状态减半 | 关 |
 
 这是预训练模型，会续写文本，不会对话。
+
+## 思考档位
+
+模型每生成一个 token 都要循环几轮，一轮大约相当于一步推理。档位就是选循环几轮：`low` 是模型默认值的一半，`medium` 是默认值，`high` 是两倍，`max` 是模型允许的最大值。`slm info` 会列出当前模型每档对应的轮数。
+
+```bash
+slm run "集中采购和分散采购的区别是" -m model --think high
+slm repl -m model --think low
+slm --serve -m model --think high
+```
+
+`pt-loop-s0` 在 RTX 5080 上的实测：
+
+| 档位 | 轮数 | 解码 | 解码状态 | 文本 loss | 全部答对的 chase | 全部答对的 arith |
+|---|---|---|---|---|---|---|
+| `low` | 2 | 约 300 tok/s | 137 MB | 3.23 | 2 步 | 1 步 |
+| `medium` | 4 | 约 200 tok/s | 205 MB | 3.12 | 3 步 | 3 步 |
+| `high` | 8 | 约 120 tok/s | 342 MB | 3.10 | 4 步 | 6 步 |
+| `max` | 16 | 约 65 tok/s | 616 MB | 3.19 | 4 步 | 7 步 |
+
+- 文本 loss 越低越好，在验证集上测，用的是普通分词。`high` 只比 `medium` 低 0.01，速度却慢将近一半，普通续写用默认档就够。`max` 的 loss 反而变差，语言部分训练时只转 2～10 轮。
+- chase 是指针追踪，arith 是嵌套算术。超过表里步数的题也能答对一部分，比如 `max` 在 chase 5 步上约 0.7，在 arith 10 步上约 0.87。
+- **推理题的结果只在按字符切 token 时成立。** 训练时题目是一个字符一个 token，而普通分词会把 `((`、`...` 这类连续标点合成一个 token。用 `slm run` 或 API 直接输入题目时，四个档位都和瞎猜差不多。所以目前档位对日常使用的影响主要是上面的文本 loss 和速度。
+
 
 ## OpenAI 兼容 API
 
@@ -79,11 +105,13 @@ print(reply.choices[0].message.content)
 | `GET /v1/models` | 列出当前模型 |
 | `GET /health` | 不需要密钥 |
 
-支持的请求字段：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`stop`、`seed`、`stream`、`stream_options.include_usage`，以及非标准的 `top_k` 和 `repeat_penalty`。请求没有给的值用命令行参数的值，比如 `-n`、`-t`。`-R` 在启动时定下，对所有请求生效。
+支持的请求字段：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`stop`、`seed`、`stream`、`stream_options.include_usage`，`reasoning_effort`，以及非标准的 `top_k` 和 `repeat_penalty`。请求没有给的值用命令行参数的值，比如 `-n`、`-t`。
+
+`reasoning_effort` 只影响这一次请求，取值是 `low`、`medium`、`high`、`max`；OpenAI 的 `none` 和 `minimal` 按 `low` 算，`xhigh` 按 `max` 算。没有给时用启动时的 `--think` 或 `-R`。
 
 - 这些模型没有用对话数据训练过。聊天消息会拼成 `User: ...` / `Assistant:` 文本让模型续写，回答的质量只是续写的质量。遇到 `\nUser:` 时停止，免得模型替用户写下一轮。
 - 请求按到达顺序一个一个处理，一次只跑一个。
-- 新请求的开头和上一次的提示词加回答完全相同时，只读新增的部分，长对话不用每次重读。
+- 新请求的开头和上一次的提示词加回答完全相同时，只读新增的部分，长对话不用每次重读。换了档位时要重读整个提示词，因为每一轮都有自己的状态。
 - `seed` 只保证同一台机器、同一后端上可复现。
 - 不支持 `n` 大于 1、`logprobs`、工具调用和图片。`n` 大于 1 和图片会返回 400，其余字段会被忽略。
 

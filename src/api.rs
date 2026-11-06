@@ -1,7 +1,9 @@
 //! The OpenAI wire format: request parsing and response bodies, free of any I/O.
 
+use clap::ValueEnum;
 use serde_json::{json, Value};
 
+use crate::config::Think;
 use crate::sample::Sampling;
 
 /// What a request may leave out.
@@ -20,6 +22,7 @@ pub struct Params {
     pub stream: bool,
     pub include_usage: bool,
     pub seed: Option<u64>,
+    pub think: Option<Think>,
     pub chat: bool,
 }
 
@@ -65,6 +68,17 @@ fn stops(v: &Value) -> Result<Vec<String>, String> {
     }
 }
 
+fn think(v: &Value) -> Result<Option<Think>, String> {
+    match v.get("reasoning_effort") {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x
+            .as_str()
+            .and_then(|s| <Think as ValueEnum>::from_str(s, true).ok())
+            .map(Some)
+            .ok_or_else(|| "`reasoning_effort` must be low, medium, high or max".to_owned()),
+    }
+}
+
 fn common(v: &Value, d: &Defaults, prompt: String, chat: bool) -> Result<Params, String> {
     if !v.is_object() {
         return Err("the body must be a JSON object".to_owned());
@@ -99,6 +113,7 @@ fn common(v: &Value, d: &Defaults, prompt: String, chat: bool) -> Result<Params,
             .and_then(Value::as_bool)
             .unwrap_or(false),
         seed: number(v, "seed")?.map(|n| n as u64),
+        think: think(v)?,
         chat,
     })
 }
@@ -351,6 +366,19 @@ mod tests {
         assert_eq!(p.stop, ["END"]);
         assert!(p.stream && p.include_usage);
         assert_eq!(p.seed, Some(9));
+    }
+
+    #[test]
+    fn reasoning_effort_picks_a_level() {
+        let d = defaults();
+        let level =
+            |e: Value| parse_completion(&json!({ "prompt": "x", "reasoning_effort": e }), &d);
+        assert_eq!(level(json!(null)).unwrap().think, None);
+        assert_eq!(level(json!("high")).unwrap().think, Some(Think::High));
+        assert_eq!(level(json!("minimal")).unwrap().think, Some(Think::Low));
+        assert_eq!(level(json!("xhigh")).unwrap().think, Some(Think::Max));
+        assert!(level(json!("huge")).is_err());
+        assert!(level(json!(3)).is_err());
     }
 
     #[test]
