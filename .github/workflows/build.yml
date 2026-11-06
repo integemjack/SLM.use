@@ -26,7 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The cache drops mlx.metallib, which only a fresh build of mlx-sys produces.
       - uses: Swatinem/rust-cache@v2
+        if: matrix.features != 'mlx'
       - name: Test
         shell: bash
         run: cargo test --release --features "${{ matrix.features }}"
@@ -49,6 +51,8 @@ jobs:
       - name: Run the packaged binary
         shell: bash
         run: |
+          # The release has only the copy next to the binary, so test with only that one.
+          find target -name mlx.metallib -delete
           "./slm-${{ matrix.name }}/slm" --version
           "./slm-${{ matrix.name }}/slm" verify -m tests/fixtures/tiny
       - uses: actions/upload-artifact@v4
