@@ -1,20 +1,33 @@
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::{bail, Result};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use slm::api::Defaults;
 use slm::cpu::Cpu;
 use slm::model::{Model, Session, CHUNK};
 use slm::ops::Ops;
 use slm::sample::{pick, Rng, Sampling};
+use slm::serve;
+use slm::text::{self, encode, Detokenizer};
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
 #[command(version, about = "Run Looped Hybrid Reasoner language models locally")]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+    /// Start the OpenAI-compatible API server
+    #[arg(long)]
+    serve: bool,
+    #[command(flatten)]
+    common: Common,
+    #[command(flatten)]
+    gen: Gen,
+    #[command(flatten)]
+    net: Net,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -41,6 +54,18 @@ struct Common {
 }
 
 #[derive(Args, Clone)]
+struct Net {
+    /// Address to listen on; use 0.0.0.0 to accept other machines
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+    /// Require this key as a Bearer token
+    #[arg(long)]
+    api_key: Option<String>,
+}
+
+#[derive(Args, Clone)]
 struct Gen {
     #[arg(short = 'n', long, default_value_t = 256)]
     max_tokens: usize,
@@ -49,6 +74,9 @@ struct Gen {
     temperature: f32,
     #[arg(long, default_value_t = 40)]
     top_k: usize,
+    /// Smallest set of tokens holding this much probability; 1 disables it
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
     /// 1 disables it
     #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
@@ -87,6 +115,15 @@ enum Cmd {
         #[arg(long, default_value_t = 256)]
         decode_tokens: usize,
     },
+    /// Start the OpenAI-compatible API server, the same as --serve
+    Serve {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        gen: Gen,
+        #[command(flatten)]
+        net: Net,
+    },
     /// Show the model and which device would run it
     Info {
         #[command(flatten)]
@@ -99,38 +136,13 @@ enum Cmd {
     },
 }
 
-fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
-    let path = dir.join("tokenizer.json");
-    Tokenizer::from_file(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))
-}
-
-fn encode(tk: &Tokenizer, text: &str) -> Result<Vec<u32>> {
-    Ok(tk
-        .encode(text, false)
-        .map_err(|e| anyhow!("{e}"))?
-        .get_ids()
-        .to_vec())
-}
-
-/// Prints tokens as they arrive, holding back bytes that do not yet form a character.
-struct Stream<'a> {
-    tk: &'a Tokenizer,
-    pending: Vec<u32>,
-}
-
-impl Stream<'_> {
-    fn push(&mut self, id: u32) -> Result<()> {
-        self.pending.push(id);
-        let text = self
-            .tk
-            .decode(&self.pending, true)
-            .map_err(|e| anyhow!("{e}"))?;
-        if !text.ends_with('\u{FFFD}') {
-            print!("{text}");
-            std::io::stdout().flush()?;
-            self.pending.clear();
-        }
-        Ok(())
+fn sampling(g: &Gen) -> Sampling {
+    Sampling {
+        temperature: g.temperature,
+        top_k: g.top_k,
+        top_p: g.top_p,
+        repeat_penalty: g.repeat_penalty,
+        repeat_window: g.repeat_window,
     }
 }
 
@@ -143,24 +155,17 @@ fn generate<O: Ops>(
     g: &Gen,
     rng: &mut Rng,
 ) -> Result<usize> {
-    let s = Sampling {
-        temperature: g.temperature,
-        top_k: g.top_k,
-        repeat_penalty: g.repeat_penalty,
-        repeat_window: g.repeat_window,
-    };
+    let s = sampling(g);
     let eot = tk.token_to_id("<|endoftext|>");
-    let mut out = Stream {
-        tk,
-        pending: Vec::new(),
-    };
+    let mut out = Detokenizer::new(tk);
     let mut made = 0;
     while made < g.max_tokens {
         let id = pick(model.logits(se)?, history, &s, rng);
         if Some(id) == eot {
             break;
         }
-        out.push(id)?;
+        print!("{}", out.push(id)?);
+        std::io::stdout().flush()?;
         history.push(id);
         model.step(se, id)?;
         made += 1;
@@ -180,6 +185,7 @@ fn decode_speed<O: Ops>(model: &Model<O>, se: &mut Session<O>, tokens: usize) ->
     let s = Sampling {
         temperature: 0.0,
         top_k: 0,
+        top_p: 1.0,
         repeat_penalty: 1.0,
         repeat_window: 0,
     };
@@ -199,7 +205,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
             common,
             gen,
         } => {
-            let tk = load_tokenizer(&common.model)?;
+            let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
             let mut se = model.session(common.loops)?;
             let mut history = encode(&tk, &prompt)?;
@@ -227,7 +233,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
             );
         }
         Cmd::Repl { common, gen } => {
-            let tk = load_tokenizer(&common.model)?;
+            let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
             let mut se = model.session(common.loops)?;
             let mut history = Vec::new();
@@ -258,7 +264,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
             prompt_tokens,
             decode_tokens,
         } => {
-            let tk = load_tokenizer(&common.model)?;
+            let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
             let unit = encode(
                 &tk,
@@ -282,6 +288,28 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
                 let mb = model.state_bytes(&se) as f64 / (1 << 20) as f64;
                 println!("{r:>3} {fill:>14.1} {dec:>14.1} {mb:>12.1}");
             }
+        }
+        Cmd::Serve { common, gen, net } => {
+            let tk = text::load(&common.model)?;
+            let model = Model::load(ops, &common.model)?;
+            let name = std::fs::canonicalize(&common.model).ok();
+            let model_id = name
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map_or("slm".to_owned(), |n| n.to_string_lossy().into_owned());
+            let options = serve::Options {
+                host: net.host,
+                port: net.port,
+                api_key: net.api_key,
+                model_id,
+                defaults: Defaults {
+                    max_tokens: gen.max_tokens,
+                    sampling: sampling(&gen),
+                },
+                loops: common.loops,
+                seed: gen.seed,
+            };
+            serve::run(model, tk, options)?;
         }
         Cmd::Info { common } => {
             let model = Model::load(ops, &common.model)?;
@@ -327,6 +355,7 @@ fn common(cmd: &Cmd) -> &Common {
         Cmd::Run { common, .. }
         | Cmd::Repl { common, .. }
         | Cmd::Bench { common, .. }
+        | Cmd::Serve { common, .. }
         | Cmd::Info { common }
         | Cmd::Verify { common } => common,
     }
@@ -334,23 +363,35 @@ fn common(cmd: &Cmd) -> &Common {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let want = common(&cli.cmd).device;
+    let cmd = match (cli.cmd, cli.serve) {
+        (Some(cmd), _) => cmd,
+        (None, true) => Cmd::Serve {
+            common: cli.common,
+            gen: cli.gen,
+            net: cli.net,
+        },
+        (None, false) => {
+            Cli::command().print_help()?;
+            return Ok(());
+        }
+    };
+    let want = common(&cmd).device;
 
     #[cfg(all(feature = "cuda", any(target_os = "windows", target_os = "linux")))]
     if want == Device::Auto || want == Device::Cuda {
         match slm::cuda::Cuda::probe()? {
-            Some(ops) => return run(ops, cli.cmd),
+            Some(ops) => return run(ops, cmd),
             None if want == Device::Cuda => bail!("no NVIDIA GPU or driver found"),
             None => {}
         }
     }
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     if want == Device::Auto || want == Device::Mlx {
-        let fp16 = common(&cli.cmd).fp16;
-        return run(slm::mlx::Mlx::new(fp16)?, cli.cmd);
+        let fp16 = common(&cmd).fp16;
+        return run(slm::mlx::Mlx::new(fp16)?, cmd);
     }
     if want == Device::Cuda || want == Device::Mlx {
         bail!("this build does not include that device");
     }
-    run(Cpu, cli.cmd)
+    run(Cpu, cmd)
 }

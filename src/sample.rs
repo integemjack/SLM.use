@@ -6,6 +6,8 @@ pub struct Sampling {
     pub temperature: f32,
     /// 0 keeps every token.
     pub top_k: usize,
+    /// Smallest set of tokens holding this much probability; 1 keeps them all.
+    pub top_p: f32,
     /// 1 disables the penalty.
     pub repeat_penalty: f32,
     /// How many recent tokens the penalty looks at.
@@ -56,14 +58,30 @@ pub fn pick(mut logits: Vec<f32>, recent: &[u32], s: &Sampling, rng: &mut Rng) -
         });
         ids.truncate(s.top_k);
     }
+    if s.top_p < 1.0 {
+        ids.sort_unstable_by(|a, b| logits[*b as usize].total_cmp(&logits[*a as usize]));
+    }
     let top = ids
         .iter()
         .map(|i| logits[*i as usize])
         .fold(f32::NEG_INFINITY, f32::max);
-    let weights: Vec<f32> = ids
+    let mut weights: Vec<f32> = ids
         .iter()
         .map(|i| ((logits[*i as usize] - top) / s.temperature).exp())
         .collect();
+    if s.top_p < 1.0 {
+        let enough = s.top_p * weights.iter().sum::<f32>();
+        let mut held = 0.0;
+        let keep = weights
+            .iter()
+            .position(|w| {
+                held += w;
+                held >= enough
+            })
+            .map_or(weights.len(), |i| i + 1);
+        ids.truncate(keep);
+        weights.truncate(keep);
+    }
     let mut r = rng.next_f32() * weights.iter().sum::<f32>();
     for (i, w) in ids.iter().zip(&weights) {
         r -= w;
@@ -83,6 +101,7 @@ mod tests {
         let s = Sampling {
             temperature: 0.0,
             top_k: 0,
+            top_p: 1.0,
             repeat_penalty: 1.0,
             repeat_window: 0,
         };
@@ -94,6 +113,7 @@ mod tests {
         let s = Sampling {
             temperature: 0.0,
             top_k: 0,
+            top_p: 1.0,
             repeat_penalty: 2.0,
             repeat_window: 8,
         };
@@ -101,10 +121,26 @@ mod tests {
     }
 
     #[test]
+    fn top_p_keeps_the_likely_tokens() {
+        let s = Sampling {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.5,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+        };
+        let mut rng = Rng::new(3);
+        for _ in 0..200 {
+            assert_eq!(pick(vec![-9.0, 5.0, -9.0, 1.0], &[], &s, &mut rng), 1);
+        }
+    }
+
+    #[test]
     fn top_k_limits_the_candidates() {
         let s = Sampling {
             temperature: 1.0,
             top_k: 2,
+            top_p: 1.0,
             repeat_penalty: 1.0,
             repeat_window: 0,
         };

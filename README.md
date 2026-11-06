@@ -43,11 +43,49 @@ slm info -m model
 | `-n, --max-tokens` | 最多生成多少 token | 256 |
 | `-t, --temperature` | 采样温度，0 表示总取概率最大的 | 0.8 |
 | `--top-k` | 只从概率最高的 k 个里采样 | 40 |
+| `--top-p` | 只从累计概率达到 p 的 token 里采样，1 表示关闭 | 1 |
 | `--repeat-penalty` | 重复惩罚，1 表示关闭 | 1.1 |
 | `--seed` | 随机种子 | 0 |
 | `--fp16` | MLX 上用 16 位浮点，解码状态减半 | 关 |
 
 这是预训练模型，会续写文本，不会对话。
+
+## OpenAI 兼容 API
+
+```bash
+slm --serve -m model --port 8080
+```
+
+默认只监听本机。要让别的机器访问，加 `--host 0.0.0.0`，这时请同时用 `--api-key` 设置密钥。
+
+用官方客户端时，把地址指向这里即可：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="不校验时随便填")
+reply = client.chat.completions.create(
+    model="model",
+    messages=[{"role": "user", "content": "集中采购和分散采购的区别是什么？"}],
+    max_tokens=200,
+)
+print(reply.choices[0].message.content)
+```
+
+| 接口 | 说明 |
+|---|---|
+| `POST /v1/chat/completions` | 支持 `stream` |
+| `POST /v1/completions` | 支持 `stream` |
+| `GET /v1/models` | 列出当前模型 |
+| `GET /health` | 不需要密钥 |
+
+支持的请求字段：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`stop`、`seed`、`stream`、`stream_options.include_usage`，以及非标准的 `top_k` 和 `repeat_penalty`。请求没有给的值用命令行参数的值，比如 `-n`、`-t`。`-R` 在启动时定下，对所有请求生效。
+
+- 这些模型没有用对话数据训练过。聊天消息会拼成 `User: ...` / `Assistant:` 文本让模型续写，回答的质量只是续写的质量。遇到 `\nUser:` 时停止，免得模型替用户写下一轮。
+- 请求按到达顺序一个一个处理，一次只跑一个。
+- 新请求的开头和上一次的提示词加回答完全相同时，只读新增的部分，长对话不用每次重读。
+- `seed` 只保证同一台机器、同一后端上可复现。
+- 不支持 `n` 大于 1、`logprobs`、工具调用和图片。`n` 大于 1 和图片会返回 400，其余字段会被忽略。
 
 ## 速度
 

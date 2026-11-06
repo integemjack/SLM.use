@@ -1,3 +1,4 @@
+pub mod api;
 pub mod config;
 pub mod cpu;
 #[cfg(all(feature = "cuda", any(target_os = "windows", target_os = "linux")))]
@@ -7,4 +8,6 @@ pub mod mlx;
 pub mod model;
 pub mod ops;
 pub mod sample;
+pub mod serve;
+pub mod text;
 pub mod verify;
