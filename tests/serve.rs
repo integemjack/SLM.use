@@ -221,6 +221,23 @@ fn another_level_does_not_continue_the_last_state() {
 }
 
 #[test]
+fn chars_gives_a_chat_only_the_last_question() {
+    let s = start(&[]);
+    let body = |messages: Value| json!({ "messages": messages, "max_tokens": 2, "chars": true });
+    let (status, reply) = post(
+        &s,
+        "/v1/chat/completions",
+        body(json!([
+            { "role": "user", "content": "Hi" },
+            { "role": "assistant", "content": "There" },
+            { "role": "user", "content": "Bye" },
+        ])),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["usage"]["prompt_tokens"], 3);
+}
+
+#[test]
 fn errors_use_the_openai_shape() {
     let s = start(&[]);
     let (status, reply) = post(&s, "/v1/completions", json!({ "max_tokens": 1 }));

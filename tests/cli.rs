@@ -27,6 +27,11 @@ fn a_level_means_its_loop_count() {
 }
 
 #[test]
+fn chars_changes_nothing_when_the_tokenizer_is_already_per_character() {
+    assert_eq!(text(&["--chars"]), text(&[]));
+}
+
+#[test]
 fn a_level_and_a_loop_count_conflict() {
     assert!(!slm(&["--think", "high", "-R", "2"]).status.success());
     assert!(!slm(&["--think", "huge"]).status.success());

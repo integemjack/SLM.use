@@ -48,6 +48,7 @@ slm info -m model
 | `--top-p` | 只从累计概率达到 p 的 token 里采样，1 表示关闭 | 1 |
 | `--repeat-penalty` | 重复惩罚，1 表示关闭 | 1.1 |
 | `--seed` | 随机种子 | 0 |
+| `--chars` | 每个字符一个 token，用来做推理题，见“思考档位” | 关 |
 | `--fp16` | MLX 上用 16 位浮点，解码状态减半 | 关 |
 
 这是预训练模型，会续写文本，不会对话。
@@ -73,7 +74,29 @@ slm --serve -m model --think high
 
 - 文本 loss 越低越好，在验证集上测，用的是普通分词。`high` 只比 `medium` 低 0.01，速度却慢将近一半，普通续写用默认档就够。`max` 的 loss 反而变差，语言部分训练时只转 2～10 轮。
 - chase 是指针追踪，arith 是嵌套算术。超过表里步数的题也能答对一部分，比如 `max` 在 chase 5 步上约 0.7，在 arith 10 步上约 0.87。
-- **推理题的结果只在按字符切 token 时成立。** 训练时题目是一个字符一个 token，而普通分词会把 `((`、`...` 这类连续标点合成一个 token。用 `slm run` 或 API 直接输入题目时，四个档位都和瞎猜差不多。所以目前档位对日常使用的影响主要是上面的文本 loss 和速度。
+- **推理题要加 `--chars`。** 训练时题目是一个字符一个 token，而普通分词会把 `((`、`...` 这类连续标点合成一个 token。不加时四个档位都和瞎猜差不多，这时档位只影响上面的文本 loss 和速度。
+
+### 做推理题
+
+```bash
+slm run "(3-((4+2)-5))=" -m model --chars --think high -n 1
+```
+
+输出的 `=` 后面就是答案。模型只练过两种题，答案都是一个字符，所以用 `-n 1`，后面继续生成的内容没有意义。
+
+| 题型 | 题面 | 答案 |
+|---|---|---|
+| arith，嵌套算术，结果对 10 取模 | `(3-((4+2)-5))=` | `2` |
+| chase，12 个节点 `a`～`l` 各指向谁，从某点走几步（几个点）到哪 | `a>k,b>c,…,l>a\|a...=` | 一个字母 |
+
+通过 API 调用时有两种方式：
+
+- 在 `/v1/completions` 的请求里加 `"chars": true`。官方 Python 客户端用 `extra_body={"chars": True}`。
+- 启动时加 `--chars`，所有请求都按字符处理，请求里的 `chars` 可以覆盖它。
+
+`/v1/chat/completions` 开了 `chars` 后不再拼对话文本，只把最后一条用户消息原样发给模型，因为模型没有在对话文本里见过这些题，这时历史消息不起作用。
+
+普通文本不要开 `--chars`：模型是用普通分词训练语言的。
 
 
 ## OpenAI 兼容 API
@@ -105,7 +128,7 @@ print(reply.choices[0].message.content)
 | `GET /v1/models` | 列出当前模型 |
 | `GET /health` | 不需要密钥 |
 
-支持的请求字段：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`stop`、`seed`、`stream`、`stream_options.include_usage`，`reasoning_effort`，以及非标准的 `top_k` 和 `repeat_penalty`。请求没有给的值用命令行参数的值，比如 `-n`、`-t`。
+支持的请求字段：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`stop`、`seed`、`stream`、`stream_options.include_usage`，`reasoning_effort`，以及非标准的 `top_k`、`repeat_penalty` 和 `chars`。请求没有给的值用命令行参数的值，比如 `-n`、`-t`。
 
 `reasoning_effort` 只影响这一次请求，取值是 `low`、`medium`、`high`、`max`；OpenAI 的 `none` 和 `minimal` 按 `low` 算，`xhigh` 按 `max` 算。没有给时用启动时的 `--think` 或 `-R`。
 

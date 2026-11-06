@@ -11,7 +11,7 @@ use slm::model::{Model, Session, CHUNK};
 use slm::ops::Ops;
 use slm::sample::{pick, Rng, Sampling};
 use slm::serve;
-use slm::text::{self, encode, Detokenizer};
+use slm::text::{self, encode, encode_chars, Detokenizer};
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -95,6 +95,19 @@ struct Gen {
     repeat_window: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Give the prompt one token per character, as the reasoning tasks were trained
+    #[arg(long)]
+    chars: bool,
+}
+
+impl Gen {
+    fn encode(&self, tk: &Tokenizer, text: &str) -> Result<Vec<u32>> {
+        if self.chars {
+            encode_chars(tk, text)
+        } else {
+            encode(tk, text)
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -219,7 +232,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
             let tk = text::load(&common.model)?;
             let model = Model::load(ops, &common.model)?;
             let mut se = model.session(common.loops(&model.cfg))?;
-            let mut history = encode(&tk, &prompt)?;
+            let mut history = gen.encode(&tk, &prompt)?;
             if history.is_empty() {
                 bail!("the prompt is empty");
             }
@@ -262,7 +275,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 || line.trim().is_empty() {
                     return Ok(());
                 }
-                let ids = encode(&tk, line.trim_end_matches(['\r', '\n']))?;
+                let ids = gen.encode(&tk, line.trim_end_matches(['\r', '\n']))?;
                 feed(&model, &mut se, &ids)?;
                 history.extend(&ids);
                 generate(&model, &mut se, &tk, &mut history, &gen, &mut rng)?;
@@ -316,6 +329,7 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
                 defaults: Defaults {
                     max_tokens: gen.max_tokens,
                     sampling: sampling(&gen),
+                    chars: gen.chars,
                 },
                 loops: common.loops(&model.cfg),
                 seed: gen.seed,

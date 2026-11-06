@@ -11,6 +11,7 @@ use crate::sample::Sampling;
 pub struct Defaults {
     pub max_tokens: usize,
     pub sampling: Sampling,
+    pub chars: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,7 @@ pub struct Params {
     pub include_usage: bool,
     pub seed: Option<u64>,
     pub think: Option<Think>,
+    pub chars: bool,
     pub chat: bool,
 }
 
@@ -79,6 +81,15 @@ fn think(v: &Value) -> Result<Option<Think>, String> {
     }
 }
 
+fn chars(v: &Value, default: bool) -> Result<bool, String> {
+    match v.get("chars") {
+        None | Some(Value::Null) => Ok(default),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| "`chars` must be true or false".to_owned()),
+    }
+}
+
 fn common(v: &Value, d: &Defaults, prompt: String, chat: bool) -> Result<Params, String> {
     if !v.is_object() {
         return Err("the body must be a JSON object".to_owned());
@@ -114,6 +125,7 @@ fn common(v: &Value, d: &Defaults, prompt: String, chat: bool) -> Result<Params,
             .unwrap_or(false),
         seed: number(v, "seed")?.map(|n| n as u64),
         think: think(v)?,
+        chars: chars(v, d.chars)?,
         chat,
     })
 }
@@ -169,6 +181,15 @@ pub fn render_chat(messages: &[Value]) -> Result<String, String> {
     Ok(out)
 }
 
+fn last_question(messages: &[Value]) -> Result<String, String> {
+    let last = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .ok_or("`messages` needs a user message")?;
+    content(last)
+}
+
 /// `/v1/chat/completions`.
 pub fn parse_chat(v: &Value, d: &Defaults) -> Result<Params, String> {
     let messages = v
@@ -178,7 +199,13 @@ pub fn parse_chat(v: &Value, d: &Defaults) -> Result<Params, String> {
     if messages.is_empty() {
         return Err("`messages` must not be empty".to_owned());
     }
-    let mut p = common(v, d, render_chat(messages)?, true)?;
+    let mut p = common(v, d, String::new(), true)?;
+    // The reasoning tasks stand alone: the model never saw one inside a transcript.
+    p.prompt = if p.chars {
+        last_question(messages)?
+    } else {
+        render_chat(messages)?
+    };
     // Without this the model goes on to write the user's next turn itself.
     p.stop.push("\nUser:".to_owned());
     Ok(p)
@@ -332,6 +359,7 @@ mod tests {
                 repeat_penalty: 1.1,
                 repeat_window: 64,
             },
+            chars: false,
         }
     }
 
@@ -379,6 +407,35 @@ mod tests {
         assert_eq!(level(json!("xhigh")).unwrap().think, Some(Think::Max));
         assert!(level(json!("huge")).is_err());
         assert!(level(json!(3)).is_err());
+    }
+
+    #[test]
+    fn chars_comes_from_the_request_or_the_server() {
+        let on = Defaults {
+            chars: true,
+            ..defaults()
+        };
+        let plain = json!({ "prompt": "x" });
+        assert!(!parse_completion(&plain, &defaults()).unwrap().chars);
+        assert!(parse_completion(&plain, &on).unwrap().chars);
+        let off = json!({ "prompt": "x", "chars": false });
+        assert!(!parse_completion(&off, &on).unwrap().chars);
+        let bad = json!({ "prompt": "x", "chars": "yes" });
+        assert!(parse_completion(&bad, &on).is_err());
+    }
+
+    #[test]
+    fn chars_sends_only_the_last_question() {
+        let m = json!([
+            { "role": "system", "content": "Be brief." },
+            { "role": "user", "content": "(1+2)=" },
+            { "role": "assistant", "content": "3" },
+            { "role": "user", "content": "(2+2)=" },
+        ]);
+        let v = json!({ "messages": m, "chars": true });
+        assert_eq!(parse_chat(&v, &defaults()).unwrap().prompt, "(2+2)=");
+        let none = json!({ "messages": [{ "role": "system", "content": "x" }], "chars": true });
+        assert!(parse_chat(&none, &defaults()).is_err());
     }
 
     #[test]

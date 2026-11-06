@@ -21,7 +21,7 @@ use crate::api::{self, Defaults, Meta, Params, StopFilter, Usage};
 use crate::model::{Model, Session, CHUNK};
 use crate::ops::Ops;
 use crate::sample::{pick, Rng};
-use crate::text::{encode, Detokenizer};
+use crate::text::{encode, encode_chars, Detokenizer};
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -341,7 +341,11 @@ fn answer<O: Ops>(
     rng: &mut Rng,
 ) -> Result<()> {
     let p = &job.params;
-    let ids = encode(tk, &p.prompt)?;
+    let ids = if p.chars {
+        encode_chars(tk, &p.prompt)?
+    } else {
+        encode(tk, &p.prompt)?
+    };
     if ids.is_empty() {
         anyhow::bail!("the prompt is empty");
     }
