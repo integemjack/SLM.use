@@ -21,7 +21,7 @@ jobs:
           - { name: linux-arm64, os: ubuntu-22.04-arm, features: cuda }
           - { name: windows-x64, os: windows-latest, features: cuda }
           - { name: windows-arm64, os: windows-11-arm, features: "" }
-          - { name: macos-arm64, os: macos-14, features: mlx }
+          - { name: macos-arm64, os: macos-latest, features: mlx }
           - { name: macos-x64, os: macos-15-intel, features: "" }
     steps:
       - uses: actions/checkout@v4
