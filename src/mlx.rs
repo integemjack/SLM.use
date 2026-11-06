@@ -1,6 +1,5 @@
-//! MLX backend for Apple silicon. Weights and scratch tensors stay flat, as in the
-//! other backends; caches keep their `[head][slot][dim]` shape so one slot can be
-//! written in place.
+//! MLX backend for Apple silicon. Weights and token tensors stay flat, as in the other
+//! backends; caches keep their `[head][slot][dh]` shape so slots can be written in place.
 
 use anyhow::Result;
 use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
@@ -8,6 +7,9 @@ use mlx_rs::ops::{concatenate_axis, maximum, sigmoid, softmax_axis};
 use mlx_rs::{transforms, Array, Dtype};
 
 use crate::ops::{At, Attn, Ops};
+
+/// Scores outside a query's range. Softmax turns them into zero, in fp16 as well.
+const MASKED: f32 = -1e4;
 
 pub struct Mlx {
     dtype: Dtype,
@@ -75,8 +77,46 @@ impl Ops for Mlx {
         Ok(())
     }
 
+    fn gather(&self, y: &mut Array, w: &Array, ids: &[u32], d: usize) -> Result<()> {
+        let list: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
+        let list = Array::from_slice(&list, &[list.len() as i32]);
+        *y = flat(&w.reshape(&[-1, d as i32])?.take_axis(&list, 0)?)?;
+        Ok(())
+    }
+
     fn copy(&self, y: &mut Array, x: At<Array>, n: usize) -> Result<()> {
         *y = part(x, n)?;
+        Ok(())
+    }
+
+    fn shift(&self, y: &mut Array, first: &Array, x: At<Array>, m: usize, d: usize) -> Result<()> {
+        let head = part(
+            At {
+                buf: first,
+                offset: 0,
+            },
+            d,
+        )?;
+        *y = if m == 1 {
+            head
+        } else {
+            concatenate_axis(&[head, part(x, (m - 1) * d)?], 0)?
+        };
+        Ok(())
+    }
+
+    fn columns(
+        &self,
+        y: &mut Array,
+        x: &Array,
+        m: usize,
+        stride: usize,
+        off: usize,
+        len: usize,
+    ) -> Result<()> {
+        let (a, b) = (off as i32, (off + len) as i32);
+        let rows = part(At { buf: x, offset: 0 }, m * stride)?.reshape(&dims(&[m, stride]))?;
+        *y = flat(&rows.try_index((.., a..b))?)?;
         Ok(())
     }
 
@@ -87,8 +127,10 @@ impl Ops for Mlx {
         rows: usize,
         cols: usize,
         x: At<Array>,
+        m: usize,
     ) -> Result<()> {
-        *y = w.reshape(&dims(&[rows, cols]))?.matmul(part(x, cols)?)?;
+        let x = part(x, m * cols)?.reshape(&dims(&[m, cols]))?;
+        *y = flat(&x.matmul(w.reshape(&dims(&[rows, cols]))?.swap_axes(0, 1)?)?)?;
         Ok(())
     }
 
@@ -97,8 +139,24 @@ impl Ops for Mlx {
         Ok(())
     }
 
-    fn scale(&self, y: &mut Array, x: At<Array>, n: usize, f: f32) -> Result<()> {
-        *y = part(x, n)?.multiply(self.scalar(f)?)?;
+    fn add_row(
+        &self,
+        y: &mut Array,
+        x: At<Array>,
+        row: At<Array>,
+        m: usize,
+        d: usize,
+    ) -> Result<()> {
+        let rows = part(x, m * d)?.reshape(&dims(&[m, d]))?;
+        *y = flat(&rows.add(part(row, d)?)?)?;
+        Ok(())
+    }
+
+    fn scale_rows(&self, y: &mut Array, x: At<Array>, f: &[f32], d: usize) -> Result<()> {
+        let m = f.len();
+        let rows = part(x, m * d)?.reshape(&dims(&[m, d]))?;
+        let f = Array::from_slice(f, &[m as i32, 1]).as_dtype(self.dtype)?;
+        *y = flat(&rows.multiply(f)?)?;
         Ok(())
     }
 
@@ -138,13 +196,14 @@ impl Ops for Mlx {
         cos: &mut Array,
         sin: &mut Array,
         inv: &Array,
-        pos: f32,
-        _half: usize,
+        pos: usize,
+        m: usize,
+        half: usize,
     ) -> Result<()> {
         // Long positions need fp32 angles.
-        let a = inv
-            .as_dtype(Dtype::Float32)?
-            .multiply(Array::from_f32(pos))?;
+        let positions: Vec<f32> = (0..m).map(|i| (pos + i) as f32).collect();
+        let p = Array::from_slice(&positions, &[m as i32, 1]);
+        let a = p.multiply(inv.as_dtype(Dtype::Float32)?.reshape(&[1, half as i32])?)?;
         *cos = a.cos()?.as_dtype(self.dtype)?;
         *sin = a.sin()?.as_dtype(self.dtype)?;
         Ok(())
@@ -156,18 +215,23 @@ impl Ops for Mlx {
         x: At<Array>,
         cos: &Array,
         sin: &Array,
+        m: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
         let half = (dh / 2) as i32;
-        let m = part(x, heads * dh)?.reshape(&dims(&[heads, dh]))?;
+        let t = part(x, m * heads * dh)?.reshape(&dims(&[m, heads, dh]))?;
         let (a, b) = (
-            m.try_index((.., 0..half))?,
-            m.try_index((.., half..2 * half))?,
+            t.try_index((.., .., 0..half))?,
+            t.try_index((.., .., half..2 * half))?,
         );
-        let left = a.multiply(cos)?.subtract(b.multiply(sin)?)?;
-        let right = a.multiply(sin)?.add(b.multiply(cos)?)?;
-        *y = flat(&concatenate_axis(&[left, right], 1)?)?;
+        let (c, s) = (
+            cos.reshape(&[m as i32, 1, half])?,
+            sin.reshape(&[m as i32, 1, half])?,
+        );
+        let left = a.multiply(&c)?.subtract(b.multiply(&s)?)?;
+        let right = a.multiply(&s)?.add(b.multiply(&c)?)?;
+        *y = flat(&concatenate_axis(&[left, right], 2)?)?;
         Ok(())
     }
 
@@ -178,37 +242,45 @@ impl Ops for Mlx {
         Ok(())
     }
 
-    fn gla_update(
+    fn gla(
         &self,
+        y: &mut Array,
         s: &mut Array,
+        q: At<Array>,
         k: At<Array>,
         v: At<Array>,
         decay: &Array,
         bias: &Array,
+        m: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
-        let d = sigmoid(decay.add(bias)?.negative()?)?.reshape(&dims(&[heads, 1, 1]))?;
-        let k = part(k, heads * dh)?.reshape(&dims(&[heads, dh, 1]))?;
-        let v = part(v, heads * dh)?.reshape(&dims(&[heads, 1, dh]))?;
-        *s = flat(
-            &s.reshape(&dims(&[heads, dh, dh]))?
-                .multiply(d)?
-                .add(k.multiply(v)?)?,
-        )?;
-        Ok(())
-    }
-
-    fn gla_read(
-        &self,
-        y: &mut Array,
-        q: At<Array>,
-        s: &Array,
-        heads: usize,
-        dh: usize,
-    ) -> Result<()> {
-        let q = part(q, heads * dh)?.reshape(&dims(&[heads, 1, dh]))?;
-        *y = flat(&q.matmul(s.reshape(&dims(&[heads, dh, dh]))?)?)?;
+        let shape = dims(&[m, heads, dh]);
+        let n = m * heads * dh;
+        let (q, k, v) = (part(q, n)?, part(k, n)?, part(v, n)?);
+        let (q, k, v) = (q.reshape(&shape)?, k.reshape(&shape)?, v.reshape(&shape)?);
+        let raw = part(
+            At {
+                buf: decay,
+                offset: 0,
+            },
+            m * heads,
+        )?
+        .reshape(&dims(&[m, heads]))?;
+        let d = sigmoid(raw.add(bias)?.negative()?)?;
+        let (h, dh32) = (heads as i32, dh as i32);
+        let mut state = s.reshape(&[h, dh32, dh32])?;
+        let mut out = Vec::with_capacity(m);
+        for i in 0..m as i32 {
+            let di = d.try_index(i)?.reshape(&[h, 1, 1])?;
+            let ki = k.try_index(i)?.reshape(&[h, dh32, 1])?;
+            let vi = v.try_index(i)?.reshape(&[h, 1, dh32])?;
+            state = state.multiply(di)?.add(ki.multiply(vi)?)?;
+            let qi = q.try_index(i)?.reshape(&[h, 1, dh32])?;
+            out.push(flat(&qi.matmul(&state)?)?);
+        }
+        *s = flat(&state)?;
+        *y = concatenate_axis(&out, 0)?;
         Ok(())
     }
 
@@ -216,14 +288,25 @@ impl Ops for Mlx {
         &self,
         cache: &mut Array,
         src: At<Array>,
-        slot: usize,
-        _cap: usize,
+        pos: usize,
+        m: usize,
+        cap: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
-        let val = part(src, heads * dh)?.reshape(&dims(&[heads, 1, dh]))?;
-        let s = slot as i32;
-        cache.try_index_mut((.., s..s + 1), val)?;
+        let vals = part(src, m * heads * dh)?
+            .reshape(&dims(&[m, heads, dh]))?
+            .swap_axes(0, 1)?;
+        let first = pos % cap;
+        let n = m.min(cap - first);
+        let (a, b) = (first as i32, (first + n) as i32);
+        cache.try_index_mut((.., a..b), vals.try_index((.., 0..n as i32))?)?;
+        if n < m {
+            cache.try_index_mut(
+                (.., 0..(m - n) as i32),
+                vals.try_index((.., n as i32..m as i32))?,
+            )?;
+        }
         Ok(())
     }
 
@@ -236,18 +319,41 @@ impl Ops for Mlx {
         v: &Array,
         a: Attn,
     ) -> Result<()> {
-        let n = a.n as i32;
-        let (k, v) = if a.n == a.cap {
-            (k.clone(), v.clone())
-        } else {
-            (k.try_index((.., 0..n))?, v.try_index((.., 0..n))?)
-        };
-        let q =
-            part(q, a.heads * a.dh)?.reshape(&dims(&[a.key_heads, a.heads / a.key_heads, a.dh]))?;
+        let (span, base) = (a.span(), a.base());
+        let slots: Vec<i32> = (base..base + span).map(|p| (p % a.cap) as i32).collect();
+        let slots = Array::from_slice(&slots, &[span as i32]);
+        let (kh, group) = (a.key_heads as i32, (a.heads / a.key_heads) as i32);
+        let keys = k
+            .take_axis(&slots, 1)?
+            .reshape(&[kh, 1, span as i32, a.dh as i32])?;
+        let vals = v
+            .take_axis(&slots, 1)?
+            .reshape(&[kh, 1, span as i32, a.dh as i32])?;
+        // [query][head][dh] → [key head][group][query][dh]
+        let q = part(q, a.m * a.heads * a.dh)?
+            .reshape(&dims(&[a.m, a.heads, a.dh]))?
+            .swap_axes(0, 1)?
+            .reshape(&[kh, group, a.m as i32, a.dh as i32])?;
+        let mut mask = vec![MASKED; a.m * span];
+        let mut seen = vec![0f32; a.m];
+        for i in 0..a.m {
+            let range = a.range(i);
+            seen[i] = if range.is_empty() { 0.0 } else { 1.0 };
+            for p in range {
+                mask[i * span + p - base] = 0.0;
+            }
+        }
+        let mask = Array::from_slice(&mask, &[a.m as i32, span as i32]).as_dtype(self.dtype)?;
+        let seen = Array::from_slice(&seen, &[a.m as i32, 1]).as_dtype(self.dtype)?;
         let scores = q
-            .matmul(k.swap_axes(-1, -2)?)?
+            .matmul(keys.swap_axes(-1, -2)?)?
             .multiply(self.scalar(a.scale)?)?;
-        *y = flat(&softmax_axis(scores, -1, None)?.matmul(v)?)?;
+        let out = softmax_axis(scores.add(mask)?, -1, None)?
+            .matmul(vals)?
+            .multiply(seen)?;
+        // [key head][group][query][dh] → [query][head][dh]
+        let out = out.reshape(&dims(&[a.heads, a.m, a.dh]))?.swap_axes(0, 1)?;
+        *y = flat(&out)?;
         Ok(())
     }
 }

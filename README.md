@@ -51,21 +51,25 @@ slm info -m model
 
 ## 速度
 
-RTX 5080，86M 模型（窗口 4096），fp32，每生成一个 token 就读回一次，单位 tok/s：
+RTX 5080，86M 模型（`pt-loop-s0`，窗口 4096），fp32，单位 tok/s。解码时每生成一个 token 就读回一次，上下文已占满窗口：
 
-| R | SLM.use CUDA | PyTorch CUDA | 解码状态 |
-|---:|---:|---:|---:|
-| 4 | 252 | 154 | 193 MB |
-| 8 | 145 | 89 | 322 MB |
-| 16 | 81 | 48 | 580 MB |
+| R | 读提示词 | 解码 | PyTorch 解码 | 解码状态 |
+|---:|---:|---:|---:|---:|
+| 4 | 2819 | 209 | 154 | 205 MB |
+| 8 | 1630 | 123 | 89 | 342 MB |
+| 16 | 884 | 67 | 48 | 616 MB |
 
-Ryzen 9 9950X 的 CPU 上，R=4 时 80 tok/s，R=16 时 28 tok/s；同一台机器上 PyTorch 是 25 和 8.5 tok/s。
+提示词每次最多处理 256 个 token，解码状态和逐 token 处理完全一致。4096 token 的提示词在 R=4 时约 1.5 秒；上下文短时更快，512 token 的提示词是 5860 tok/s，解码是 248 tok/s。
 
-提示词也是逐 token 处理的，速度和解码相同。4096 token 的提示词在 R=4 时要约 16 秒。
+Ryzen 9 9950X 的 CPU 上，读提示词 R=4 时 1789 tok/s、R=16 时 534 tok/s（2048 token），此时解码是 67 和 22 tok/s。
+
+带 G 层的模型（`g86-f`）上下文越长越慢：读 16384 token 的提示词时，R=4 约 1505 tok/s，之后解码约 151 tok/s。
 
 ## 实现
 
 模型逻辑只写一份（`src/model.rs`），基于 `src/ops.rs` 里的一组运算；`src/cpu.rs`、`src/cuda.rs`、`src/mlx.rs` 分别实现这组运算。
+
+解码和读提示词走同一段代码：模型每次前进 m 个 token，m=1 就是解码。滑动窗口的缓存比窗口多 256 个位置，这样一块里靠前的 token 仍能读到被同一块覆盖的旧内容。
 
 - CUDA：内核在 `kernels/slm.cu`，预编译成 `kernels/slm.ptx` 嵌进程序，运行时只加载显卡驱动。改了内核要运行 `tools/build_kernels.sh`，这一步需要 CUDA 12.x 的 `nvcc`。
 - MLX：通过 [mlx-rs](https://github.com/oxiglade/mlx-rs)。
@@ -83,4 +87,4 @@ cargo build --release                   # 只用 CPU
 
 `tests/fixtures/tiny` 是一个随机权重的小模型，包含所有层类型，并带有 PyTorch 算出的逐位置 logits。`cargo test` 用它核对每个后端，CI 在所有平台上都会跑。
 
-要核对真实模型，先用 `tools/make_fixture.py` 生成参考值，再运行 `slm verify -m model`。
+`cargo test` 还会把小模型的前缀按不同块大小读入，再逐 token 解码，核对块处理后的状态。要核对真实模型，先用 `tools/make_fixture.py` 生成参考值，再运行 `slm verify -m model`，它同时检查解码和读提示词。

@@ -1,4 +1,4 @@
-//! Token-by-token decoding of the Looped Hybrid Reasoner.
+//! The Looped Hybrid Reasoner, advancing by any number of tokens at a time.
 //!
 //! ```text
 //! token → embedding → prelude → e
@@ -7,9 +7,12 @@
 //! → coda → logits
 //! ```
 //!
-//! Each loop keeps its own state for the core blocks. Sliding-window caches are ring
-//! buffers: attention does not depend on slot order, because positions are already
-//! encoded into the keys.
+//! Each loop keeps its own state for the core blocks. Decoding is one token at a time
+//! and a prompt goes in chunks, through the same code, so the state after a chunk is the
+//! state that many single steps would leave. Sliding-window caches are rings with room
+//! for a chunk beyond the window: a query near the start of a chunk still needs the
+//! oldest tokens after the chunk has been stored. Attention does not depend on slot
+//! order, because positions are already encoded into the keys.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +22,12 @@ use safetensors::{Dtype, SafeTensors};
 
 use crate::config::Config;
 use crate::ops::{at, Attn, Ops};
+
+/// Most tokens advanced at once.
+pub const CHUNK: usize = 256;
+/// Query × slot scores a chunk may hold, which limits chunks once a global layer has
+/// a long history.
+const MAX_SCORES: usize = 1 << 28;
 
 struct Weights {
     tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
@@ -156,25 +165,28 @@ enum State<B> {
         k: B,
         v: B,
         prev: B,
-        len: usize,
         cap: usize,
         scores: B,
     },
 }
 
-/// Buffers reused by every block, so a step allocates nothing.
+/// Buffers reused by every block, so advancing allocates only when a chunk grows.
 struct Scratch<B> {
     n: B,
     mix: B,
     q: B,
     k: B,
+    v: B,
+    g: B,
     y: B,
     y2: B,
     h: B,
     t: B,
     d: B,
+    shifted: B,
     prev_kv: B,
     up: B,
+    gate: B,
     mid: B,
     scores: B,
     cos: B,
@@ -206,6 +218,7 @@ pub struct Session<O: Ops> {
     s: O::Buf,
     e0: O::Buf,
     e_proj: O::Buf,
+    last: O::Buf,
     logits: O::Buf,
 }
 
@@ -288,13 +301,17 @@ impl<O: Ops> Model<O> {
             + self.loop_embed.as_ref().map_or(0, m)
     }
 
+    fn cap(&self) -> usize {
+        self.cfg.window + CHUNK
+    }
+
     fn new_state(&self, b: &Block<O::Buf>) -> Result<State<O::Buf>> {
         let (c, ops) = (&self.cfg, &self.ops);
         let (h, dh) = (c.n_heads, c.head_dim());
         Ok(match b.mixer {
             Mixer::Window { .. } => State::Window {
-                k: ops.zeros_cache(h, c.window, dh)?,
-                v: ops.zeros_cache(h, c.window, dh)?,
+                k: ops.zeros_cache(h, self.cap(), dh)?,
+                v: ops.zeros_cache(h, self.cap(), dh)?,
             },
             Mixer::Linear { .. } => State::Linear {
                 s: ops.zeros(h * dh * dh)?,
@@ -306,9 +323,8 @@ impl<O: Ops> Model<O> {
                     k: ops.zeros_cache(kh, cap, dh)?,
                     v: ops.zeros_cache(kh, cap, dh)?,
                     prev: ops.zeros(c.d_model)?,
-                    len: 0,
                     cap,
-                    scores: ops.zeros(h * cap)?,
+                    scores: ops.zeros(1)?,
                 }
             }
         })
@@ -332,15 +348,19 @@ impl<O: Ops> Model<O> {
             mix: z(4 * d)?,
             q: z(d)?,
             k: z(d)?,
+            v: z(d)?,
+            g: z(d)?,
             y: z(d)?,
             y2: z(d)?,
             h: z(d)?,
             t: z(d)?,
             d: z(self.cfg.n_heads)?,
+            shifted: z(d)?,
             prev_kv: z(2 * d)?,
             up: z(4 * d)?,
-            mid: z(4 * d)?,
-            scores: z(self.cfg.n_heads * self.cfg.window)?,
+            gate: z(2 * d)?,
+            mid: z(2 * d)?,
+            scores: z(1)?,
             cos: z(half)?,
             sin: z(half)?,
         };
@@ -355,18 +375,13 @@ impl<O: Ops> Model<O> {
             s: z(d)?,
             e0: z(d)?,
             e_proj: z(d)?,
+            last: z(d)?,
             logits: z(self.cfg.vocab_size)?,
         })
     }
 
     /// Doubles a global cache, which moves every head's data.
-    fn grow(
-        &self,
-        k: &mut O::Buf,
-        v: &mut O::Buf,
-        scores: &mut O::Buf,
-        cap: &mut usize,
-    ) -> Result<()> {
+    fn grow(&self, k: &mut O::Buf, v: &mut O::Buf, cap: &mut usize) -> Result<()> {
         let (kh, dh) = (self.cfg.global_kv_heads, self.cfg.head_dim());
         let (old, new) = (*cap, *cap * 2);
         for buf in [k, v] {
@@ -378,7 +393,6 @@ impl<O: Ops> Model<O> {
             }
             *buf = self.ops.upload_cache(&out, kh, new, dh)?;
         }
-        *scores = self.ops.zeros(self.cfg.n_heads * new)?;
         *cap = new;
         Ok(())
     }
@@ -391,31 +405,50 @@ impl<O: Ops> Model<O> {
         e0: &O::Buf,
         sc: &mut Scratch<O::Buf>,
         pos: usize,
+        m: usize,
     ) -> Result<()> {
         let ops = &self.ops;
         let c = &self.cfg;
         let (d, heads, dh, eps) = (c.d_model, c.n_heads, c.head_dim(), c.norm_eps);
         let scale = 1.0 / (dh as f32).sqrt();
-        ops.rms(&mut sc.n, at(x, 0), &b.norm1, 1, d, eps)?;
+        let n = m * d;
+        ops.rms(&mut sc.n, at(x, 0), &b.norm1, m, d, eps)?;
+        // One token needs no copy to split a row: its columns are already contiguous.
+        macro_rules! col {
+            ($y:ident, $x:ident, $stride:expr, $off:expr, $len:expr) => {
+                if m == 1 {
+                    at(&sc.$x, $off)
+                } else {
+                    ops.columns(&mut sc.$y, &sc.$x, m, $stride, $off, $len)?;
+                    at(&sc.$y, 0)
+                }
+            };
+        }
         let mut has_h = true;
         match (&b.mixer, st) {
             (Mixer::Window { qkv, o }, State::Window { k, v }) => {
-                ops.linear(&mut sc.mix, &qkv.w, qkv.rows, d, at(&sc.n, 0))?;
-                ops.rope(&mut sc.q, at(&sc.mix, 0), &sc.cos, &sc.sin, heads, dh)?;
-                ops.rope(&mut sc.k, at(&sc.mix, d), &sc.cos, &sc.sin, heads, dh)?;
-                let slot = pos % c.window;
-                ops.store(k, at(&sc.k, 0), slot, c.window, heads, dh)?;
-                ops.store(v, at(&sc.mix, 2 * d), slot, c.window, heads, dh)?;
+                ops.linear(&mut sc.mix, &qkv.w, qkv.rows, d, at(&sc.n, 0), m)?;
+                let raw = col!(y, mix, 3 * d, 0, d);
+                ops.rope(&mut sc.q, raw, &sc.cos, &sc.sin, m, heads, dh)?;
+                let raw = col!(y, mix, 3 * d, d, d);
+                ops.rope(&mut sc.k, raw, &sc.cos, &sc.sin, m, heads, dh)?;
+                let vals = col!(v, mix, 3 * d, 2 * d, d);
+                let cap = self.cap();
+                ops.store(k, at(&sc.k, 0), pos, m, cap, heads, dh)?;
+                ops.store(v, vals, pos, m, cap, heads, dh)?;
                 let a = Attn {
-                    n: (pos + 1).min(c.window),
-                    cap: c.window,
+                    pos,
+                    m,
+                    reach: c.window,
+                    gap: 0,
+                    cap,
                     heads,
                     key_heads: heads,
                     dh,
                     scale,
                 };
                 ops.attend(&mut sc.y, &mut sc.scores, at(&sc.q, 0), k, v, a)?;
-                ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0))?;
+                ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0), m)?;
             }
             (
                 Mixer::Linear {
@@ -427,15 +460,29 @@ impl<O: Ops> Model<O> {
                 },
                 State::Linear { s },
             ) => {
-                ops.linear(&mut sc.mix, &qkvg.w, qkvg.rows, d, at(&sc.n, 0))?;
-                ops.l2norm(&mut sc.q, at(&sc.mix, 0), heads, dh)?;
-                ops.l2norm(&mut sc.k, at(&sc.mix, d), heads, dh)?;
-                ops.linear(&mut sc.d, &decay.w, heads, d, at(&sc.n, 0))?;
-                ops.gla_update(s, at(&sc.k, 0), at(&sc.mix, 2 * d), &sc.d, bias, heads, dh)?;
-                ops.gla_read(&mut sc.y, at(&sc.q, 0), s, heads, dh)?;
-                ops.rms(&mut sc.y2, at(&sc.y, 0), head_norm, heads, dh, eps)?;
-                ops.silu_mul(&mut sc.y, at(&sc.mix, 3 * d), at(&sc.y2, 0), d)?;
-                ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0))?;
+                ops.linear(&mut sc.mix, &qkvg.w, qkvg.rows, d, at(&sc.n, 0), m)?;
+                let raw = col!(y, mix, 4 * d, 0, d);
+                ops.l2norm(&mut sc.q, raw, m * heads, dh)?;
+                let raw = col!(y, mix, 4 * d, d, d);
+                ops.l2norm(&mut sc.k, raw, m * heads, dh)?;
+                let vals = col!(v, mix, 4 * d, 2 * d, d);
+                let gate = col!(g, mix, 4 * d, 3 * d, d);
+                ops.linear(&mut sc.d, &decay.w, heads, d, at(&sc.n, 0), m)?;
+                ops.gla(
+                    &mut sc.y,
+                    s,
+                    at(&sc.q, 0),
+                    at(&sc.k, 0),
+                    vals,
+                    &sc.d,
+                    bias,
+                    m,
+                    heads,
+                    dh,
+                )?;
+                ops.rms(&mut sc.y2, at(&sc.y, 0), head_norm, m * heads, dh, eps)?;
+                ops.silu_mul(&mut sc.y, gate, at(&sc.y2, 0), n)?;
+                ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0), m)?;
             }
             (
                 Mixer::Global { q, kv, o, norm_e },
@@ -443,40 +490,45 @@ impl<O: Ops> Model<O> {
                     k,
                     v,
                     prev,
-                    len,
                     cap,
                     scores,
                 },
             ) => {
                 if let Some(w) = norm_e {
-                    ops.rms(&mut sc.t, at(e0, 0), w, 1, d, eps)?;
-                    ops.add(&mut sc.y, at(&sc.n, 0), at(&sc.t, 0), d)?;
+                    ops.rms(&mut sc.t, at(e0, 0), w, m, d, eps)?;
+                    ops.add(&mut sc.y, at(&sc.n, 0), at(&sc.t, 0), n)?;
                     std::mem::swap(&mut sc.n, &mut sc.y);
                 }
                 let (kh, kd) = (c.global_kv_heads, c.global_kv_heads * dh);
-                ops.linear(&mut sc.q, &q.w, d, d, at(&sc.n, 0))?;
-                ops.linear(&mut sc.mix, &kv.w, 2 * kd, d, at(&sc.n, 0))?;
+                ops.linear(&mut sc.q, &q.w, d, d, at(&sc.n, 0), m)?;
+                ops.linear(&mut sc.mix, &kv.w, 2 * kd, d, at(&sc.n, 0), m)?;
                 if c.global_logn != 0 {
-                    let f = (pos as f32).ln_1p() / (c.global_logn as f32).ln();
-                    ops.scale(&mut sc.y, at(&sc.q, 0), d, f)?;
+                    let log = (c.global_logn as f32).ln();
+                    let f: Vec<f32> = (0..m).map(|i| ((pos + i) as f32).ln_1p() / log).collect();
+                    ops.scale_rows(&mut sc.y, at(&sc.q, 0), &f, d)?;
                     std::mem::swap(&mut sc.q, &mut sc.y);
                 }
-                if *len == *cap {
-                    self.grow(k, v, scores, cap)?;
+                while pos + m > *cap {
+                    self.grow(k, v, cap)?;
                 }
-                if c.global_kshift != 0 {
-                    ops.linear(&mut sc.prev_kv, &kv.w, 2 * kd, d, at(prev, 0))?;
-                    ops.store(k, at(&sc.prev_kv, 0), *len, *cap, kh, dh)?;
-                    ops.copy(prev, at(&sc.n, 0), d)?;
+                let keys = if c.global_kshift != 0 {
+                    ops.shift(&mut sc.shifted, prev, at(&sc.n, 0), m, d)?;
+                    ops.linear(&mut sc.prev_kv, &kv.w, 2 * kd, d, at(&sc.shifted, 0), m)?;
+                    ops.copy(prev, at(&sc.n, (m - 1) * d), d)?;
+                    col!(k, prev_kv, 2 * kd, 0, kd)
                 } else {
-                    ops.store(k, at(&sc.mix, 0), *len, *cap, kh, dh)?;
-                }
-                ops.store(v, at(&sc.mix, kd), *len, *cap, kh, dh)?;
-                *len += 1;
+                    col!(k, mix, 2 * kd, 0, kd)
+                };
+                let vals = col!(v, mix, 2 * kd, kd, kd);
+                ops.store(k, keys, pos, m, *cap, kh, dh)?;
+                ops.store(v, vals, pos, m, *cap, kh, dh)?;
                 let far = if c.global_far != 0 { c.window } else { 0 };
-                if *len > far {
+                if pos + m > far {
                     let a = Attn {
-                        n: *len - far,
+                        pos,
+                        m,
+                        reach: usize::MAX,
+                        gap: far,
                         cap: *cap,
                         heads,
                         key_heads: kh,
@@ -484,7 +536,7 @@ impl<O: Ops> Model<O> {
                         scale,
                     };
                     ops.attend(&mut sc.y, scores, at(&sc.q, 0), k, v, a)?;
-                    ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0))?;
+                    ops.linear(&mut sc.h, &o.w, d, d, at(&sc.y, 0), m)?;
                 } else {
                     has_h = false;
                 }
@@ -492,74 +544,85 @@ impl<O: Ops> Model<O> {
             _ => bail!("state does not match its block"),
         }
         if has_h {
-            ops.add(&mut sc.t, at(x, 0), at(&sc.h, 0), d)?;
+            ops.add(&mut sc.t, at(x, 0), at(&sc.h, 0), n)?;
             std::mem::swap(x, &mut sc.t);
         }
-        ops.rms(&mut sc.n, at(x, 0), &b.norm2, 1, d, eps)?;
-        let m = b.down.cols;
-        ops.linear(&mut sc.up, &b.up.w, 2 * m, d, at(&sc.n, 0))?;
-        ops.silu_mul(&mut sc.mid, at(&sc.up, 0), at(&sc.up, m), m)?;
-        ops.linear(&mut sc.h, &b.down.w, d, m, at(&sc.mid, 0))?;
-        ops.add(&mut sc.t, at(x, 0), at(&sc.h, 0), d)?;
+        ops.rms(&mut sc.n, at(x, 0), &b.norm2, m, d, eps)?;
+        let hidden = b.down.cols;
+        ops.linear(&mut sc.up, &b.up.w, 2 * hidden, d, at(&sc.n, 0), m)?;
+        let gate = col!(gate, up, 2 * hidden, 0, hidden);
+        let amp = col!(mid, up, 2 * hidden, hidden, hidden);
+        ops.silu_mul(&mut sc.y, gate, amp, m * hidden)?;
+        ops.linear(&mut sc.h, &b.down.w, d, hidden, at(&sc.y, 0), m)?;
+        ops.add(&mut sc.t, at(x, 0), at(&sc.h, 0), n)?;
         std::mem::swap(x, &mut sc.t);
         Ok(())
     }
 
-    /// Feeds one token and leaves its logits in the session.
-    pub fn step(&self, se: &mut Session<O>, token: u32) -> Result<()> {
+    /// Advances by up to `CHUNK` tokens. Logits come from the last one, and only when asked.
+    fn advance(&self, se: &mut Session<O>, tokens: &[u32], want_logits: bool) -> Result<()> {
         let ops = &self.ops;
-        let d = self.cfg.d_model;
-        let pos = se.pos;
-        let half = self.cfg.head_dim() / 2;
+        let (d, m, pos) = (self.cfg.d_model, tokens.len(), se.pos);
         ops.rope_table(
             &mut se.sc.cos,
             &mut se.sc.sin,
             &self.inv_freq,
-            pos as f32,
-            half,
+            pos,
+            m,
+            self.cfg.head_dim() / 2,
         )?;
-        ops.copy(&mut se.e0, at(&self.embed.w, token as usize * d), d)?;
-        ops.copy(&mut se.x, at(&se.e0, 0), d)?;
+        ops.gather(&mut se.e0, &self.embed.w, tokens, d)?;
+        ops.copy(&mut se.x, at(&se.e0, 0), m * d)?;
         for (b, st) in self.prelude.iter().zip(&mut se.prelude) {
-            self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos)?;
+            self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos, m)?;
         }
         if let (Some(inject), Some(loop_embed)) = (&self.inject, &self.loop_embed) {
-            ops.linear(&mut se.e_proj, &inject.w, d, d, at(&se.x, 0))?;
-            ops.copy(&mut se.s, at(&se.x, 0), d)?;
+            ops.linear(&mut se.e_proj, &inject.w, d, d, at(&se.x, 0), m)?;
+            ops.copy(&mut se.s, at(&se.x, 0), m * d)?;
             for r in 0..se.loops {
-                ops.add(&mut se.sc.t, at(&se.s, 0), at(&se.e_proj, 0), d)?;
-                ops.add(&mut se.x, at(&se.sc.t, 0), at(&loop_embed.w, r * d), d)?;
+                ops.add(&mut se.sc.t, at(&se.s, 0), at(&se.e_proj, 0), m * d)?;
+                ops.add_row(&mut se.x, at(&se.sc.t, 0), at(&loop_embed.w, r * d), m, d)?;
                 for (b, st) in self.core.iter().zip(&mut se.core[r]) {
-                    self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos)?;
+                    self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos, m)?;
                 }
                 if self.cfg.damp == 1.0 {
                     std::mem::swap(&mut se.s, &mut se.x);
                 } else {
-                    ops.mix(&mut se.sc.t, at(&se.s, 0), at(&se.x, 0), d, self.cfg.damp)?;
+                    ops.mix(
+                        &mut se.sc.t,
+                        at(&se.s, 0),
+                        at(&se.x, 0),
+                        m * d,
+                        self.cfg.damp,
+                    )?;
                     std::mem::swap(&mut se.s, &mut se.sc.t);
                 }
             }
             std::mem::swap(&mut se.x, &mut se.s);
         }
         for (b, st) in self.coda.iter().zip(&mut se.coda) {
-            self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos)?;
+            self.block(b, st, &mut se.x, &se.e0, &mut se.sc, pos, m)?;
         }
-        ops.rms(
-            &mut se.sc.n,
-            at(&se.x, 0),
-            &self.norm_f,
-            1,
-            d,
-            self.cfg.norm_eps,
-        )?;
-        ops.linear(
-            &mut se.logits,
-            &self.embed.w,
-            self.cfg.vocab_size,
-            d,
-            at(&se.sc.n, 0),
-        )?;
-        se.pos += 1;
+        if want_logits {
+            ops.copy(&mut se.last, at(&se.x, (m - 1) * d), d)?;
+            ops.rms(
+                &mut se.sc.n,
+                at(&se.last, 0),
+                &self.norm_f,
+                1,
+                d,
+                self.cfg.norm_eps,
+            )?;
+            ops.linear(
+                &mut se.logits,
+                &self.embed.w,
+                self.cfg.vocab_size,
+                d,
+                at(&se.sc.n, 0),
+                1,
+            )?;
+        }
+        se.pos += m;
         let mut keep = vec![&se.logits];
         for st in se
             .prelude
@@ -576,6 +639,33 @@ impl<O: Ops> Model<O> {
         ops.flush(&keep)
     }
 
+    /// Feeds one token and leaves its logits in the session.
+    pub fn step(&self, se: &mut Session<O>, token: u32) -> Result<()> {
+        self.advance(se, &[token], true)
+    }
+
+    fn chunk_at(&self, pos: usize, limit: usize) -> usize {
+        let chunk = limit.min(CHUNK);
+        if self.cfg.coda.contains('G') || self.cfg.prelude.contains('G') {
+            chunk.min((MAX_SCORES / self.cfg.n_heads / (pos + 1)).max(1))
+        } else {
+            chunk
+        }
+    }
+
+    /// Feeds a prompt in chunks of at most `limit` tokens and leaves the logits of the
+    /// last token in the session.
+    pub fn feed(&self, se: &mut Session<O>, tokens: &[u32], limit: usize) -> Result<()> {
+        let mut rest = tokens;
+        while !rest.is_empty() {
+            let m = self.chunk_at(se.pos, limit).min(rest.len());
+            let (now, later) = rest.split_at(m);
+            self.advance(se, now, later.is_empty())?;
+            rest = later;
+        }
+        Ok(())
+    }
+
     pub fn logits(&self, se: &Session<O>) -> Result<Vec<f32>> {
         self.ops.read(&se.logits, self.cfg.vocab_size)
     }
@@ -585,9 +675,9 @@ impl<O: Ops> Model<O> {
         let c = &self.cfg;
         let dh = c.head_dim();
         let one = |st: &State<O::Buf>| match st {
-            State::Window { .. } => 2 * c.n_heads * c.window * dh,
+            State::Window { .. } => 2 * c.n_heads * self.cap() * dh,
             State::Linear { .. } => c.n_heads * dh * dh,
-            State::Global { len, .. } => 2 * c.global_kv_heads * len * dh + c.d_model,
+            State::Global { .. } => 2 * c.global_kv_heads * se.pos * dh + c.d_model,
         };
         let n: usize = se
             .prelude

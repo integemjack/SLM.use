@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use slm::cpu::Cpu;
-use slm::model::{Model, Session};
+use slm::model::{Model, Session, CHUNK};
 use slm::ops::Ops;
 use slm::sample::{pick, Rng, Sampling};
 use tokenizers::Tokenizer;
@@ -82,7 +82,7 @@ enum Cmd {
         /// Loop counts to measure
         #[arg(long, num_args = 1.., default_values_t = [4usize, 8, 16])]
         loop_counts: Vec<usize>,
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = 4096)]
         prompt_tokens: usize,
         #[arg(long, default_value_t = 256)]
         decode_tokens: usize,
@@ -170,9 +170,7 @@ fn generate<O: Ops>(
 
 fn feed<O: Ops>(model: &Model<O>, se: &mut Session<O>, ids: &[u32]) -> Result<f64> {
     let t = Instant::now();
-    for id in ids {
-        model.step(se, *id)?;
-    }
+    model.feed(se, ids, CHUNK)?;
     model.logits(se)?;
     Ok(ids.len() as f64 / t.elapsed().as_secs_f64())
 }
@@ -305,17 +303,19 @@ fn run<O: Ops>(ops: O, cmd: Cmd) -> Result<()> {
         }
         Cmd::Verify { common } => {
             let model = Model::load(ops, &common.model)?;
-            let r = slm::verify::run(&model, &common.model)?;
-            println!(
-                "{}: {} steps, {} checked, max |diff| {:.6}, same argmax {}",
-                model.device(),
-                r.steps,
-                r.checked,
-                r.max_diff,
-                r.same_argmax
-            );
-            if r.max_diff > 1e-2 || !r.same_argmax {
-                bail!("logits differ from the reference");
+            let (plain, prompt) = slm::verify::run(&model, &common.model)?;
+            for (name, r) in [("decode", &plain), ("prompt", &prompt)] {
+                println!(
+                    "{}: {name}: {} steps, {} checked, max |diff| {:.6}, same argmax {}",
+                    model.device(),
+                    r.steps,
+                    r.checked,
+                    r.max_diff,
+                    r.same_argmax
+                );
+                if r.max_diff > 1e-2 || !r.same_argmax {
+                    bail!("logits differ from the reference");
+                }
             }
         }
     }

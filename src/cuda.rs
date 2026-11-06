@@ -4,7 +4,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
 };
@@ -14,29 +14,39 @@ use crate::ops::{At, Attn, Ops};
 
 const PTX: &str = include_str!("../kernels/slm.ptx");
 const BLOCK: usize = 32;
+/// MAX_DH in kernels/slm.cu.
+const MAX_DH: usize = 256;
 const RMS_THREADS: u32 = 64;
-/// Slices per query head in an attention call.
-const ATTEND_SLICES: usize = 256;
+const GLA_THREADS: u32 = 64;
+/// Slices per query in an attention call, sharing about this many threads per head.
+const ATTEND_THREADS: usize = 256;
 
 pub type Buf = CudaSlice<f32>;
 
 struct Kernels {
     linear: CudaFunction,
+    transpose: CudaFunction,
+    linear_many: CudaFunction,
+    gather: CudaFunction,
     copy: CudaFunction,
+    shift: CudaFunction,
+    columns: CudaFunction,
     add: CudaFunction,
+    add_row: CudaFunction,
     scale: CudaFunction,
+    scale_rows: CudaFunction,
     mix: CudaFunction,
     rms: CudaFunction,
     silu_mul: CudaFunction,
     rope_table: CudaFunction,
     rope: CudaFunction,
     l2norm: CudaFunction,
-    gla_update: CudaFunction,
-    gla_read: CudaFunction,
+    gla: CudaFunction,
     store: CudaFunction,
     attn_score: CudaFunction,
     attn_exp: CudaFunction,
     attn_sum: CudaFunction,
+    attn_part: CudaFunction,
     attn_join: CudaFunction,
 }
 
@@ -82,21 +92,28 @@ impl Cuda {
         };
         let k = Kernels {
             linear: f("slm_linear")?,
+            transpose: f("slm_transpose")?,
+            linear_many: f("slm_linear_many")?,
+            gather: f("slm_gather")?,
             copy: f("slm_copy")?,
+            shift: f("slm_shift")?,
+            columns: f("slm_columns")?,
             add: f("slm_add")?,
+            add_row: f("slm_add_row")?,
             scale: f("slm_scale")?,
+            scale_rows: f("slm_scale_rows")?,
             mix: f("slm_mix")?,
             rms: f("slm_rms")?,
             silu_mul: f("slm_silu_mul")?,
             rope_table: f("slm_rope_table")?,
             rope: f("slm_rope")?,
             l2norm: f("slm_l2norm")?,
-            gla_update: f("slm_gla_update")?,
-            gla_read: f("slm_gla_read")?,
+            gla: f("slm_gla")?,
             store: f("slm_store")?,
             attn_score: f("slm_attn_score")?,
             attn_exp: f("slm_attn_exp")?,
             attn_sum: f("slm_attn_sum")?,
+            attn_part: f("slm_attn_part")?,
             attn_join: f("slm_attn_join")?,
         };
         Ok(Some(Self { ctx, stream, k }))
@@ -151,6 +168,28 @@ impl Ops for Cuda {
         Ok(())
     }
 
+    fn gather(&self, y: &mut Buf, w: &Buf, ids: &[u32], d: usize) -> Result<()> {
+        let m = ids.len();
+        self.ensure(y, m * d)?;
+        if m == 1 {
+            return self.copy(
+                y,
+                At {
+                    buf: w,
+                    offset: ids[0] as usize * d,
+                },
+                d,
+            );
+        }
+        let list: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
+        let list = self.stream.clone_htod(&list[..])?;
+        let (m32, d32) = (m as i32, d as i32);
+        launch!(self, gather, m * d, &*y, w, &list, &m32, &d32);
+        // The ids must stay allocated until the kernel has read them.
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
     fn copy(&self, y: &mut Buf, x: At<Buf>, n: usize) -> Result<()> {
         self.ensure(y, n)?;
         let n32 = n as i32;
@@ -159,11 +198,50 @@ impl Ops for Cuda {
         Ok(())
     }
 
-    fn linear(&self, y: &mut Buf, w: &Buf, rows: usize, cols: usize, x: At<Buf>) -> Result<()> {
-        self.ensure(y, rows)?;
-        let (r, c) = (rows as i32, cols as i32);
-        let x = view(x, cols);
-        launch!(self, linear, rows, &*y, w, &x, &r, &c);
+    fn shift(&self, y: &mut Buf, first: &Buf, x: At<Buf>, m: usize, d: usize) -> Result<()> {
+        self.ensure(y, m * d)?;
+        let (m32, d32) = (m as i32, d as i32);
+        let x = x.buf.slice(x.offset..);
+        launch!(self, shift, m * d, &*y, first, &x, &m32, &d32);
+        Ok(())
+    }
+
+    fn columns(
+        &self,
+        y: &mut Buf,
+        x: &Buf,
+        m: usize,
+        stride: usize,
+        off: usize,
+        len: usize,
+    ) -> Result<()> {
+        self.ensure(y, m * len)?;
+        let (a, b, c, e) = (m as i32, stride as i32, off as i32, len as i32);
+        launch!(self, columns, m * len, &*y, x, &a, &b, &c, &e);
+        Ok(())
+    }
+
+    fn linear(
+        &self,
+        y: &mut Buf,
+        w: &Buf,
+        rows: usize,
+        cols: usize,
+        x: At<Buf>,
+        m: usize,
+    ) -> Result<()> {
+        self.ensure(y, m * rows)?;
+        let (r, c, m32) = (rows as i32, cols as i32, m as i32);
+        let x = view(x, m * cols);
+        if m < BLOCK {
+            launch!(self, linear, m * rows, &*y, w, &x, &r, &c, &m32);
+            return Ok(());
+        }
+        let xt = self.stream.alloc_zeros::<f32>(m * cols)?;
+        launch!(self, transpose, m * cols, &xt, &x, &m32, &c);
+        launch!(self, linear_many, m * rows, &*y, w, &xt, &r, &c, &m32);
+        // The transposed copy must stay allocated until the kernel has read it.
+        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -175,11 +253,27 @@ impl Ops for Cuda {
         Ok(())
     }
 
-    fn scale(&self, y: &mut Buf, x: At<Buf>, n: usize, f: f32) -> Result<()> {
-        self.ensure(y, n)?;
-        let n32 = n as i32;
-        let x = view(x, n);
-        launch!(self, scale, n, &*y, &x, &n32, &f);
+    fn add_row(&self, y: &mut Buf, x: At<Buf>, row: At<Buf>, m: usize, d: usize) -> Result<()> {
+        self.ensure(y, m * d)?;
+        let (m32, d32) = (m as i32, d as i32);
+        let (x, row) = (view(x, m * d), view(row, d));
+        launch!(self, add_row, m * d, &*y, &x, &row, &m32, &d32);
+        Ok(())
+    }
+
+    fn scale_rows(&self, y: &mut Buf, x: At<Buf>, f: &[f32], d: usize) -> Result<()> {
+        let m = f.len();
+        self.ensure(y, m * d)?;
+        let (m32, d32) = (m as i32, d as i32);
+        let xv = view(x, m * d);
+        if m == 1 {
+            launch!(self, scale, d, &*y, &xv, &d32, &f[0]);
+            return Ok(());
+        }
+        let factors = self.stream.clone_htod(f)?;
+        launch!(self, scale_rows, m * d, &*y, &xv, &factors, &m32, &d32);
+        // The factors must stay allocated until the kernel has read them.
+        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -226,13 +320,14 @@ impl Ops for Cuda {
         cos: &mut Buf,
         sin: &mut Buf,
         inv: &Buf,
-        pos: f32,
+        pos: usize,
+        m: usize,
         half: usize,
     ) -> Result<()> {
-        self.ensure(cos, half)?;
-        self.ensure(sin, half)?;
-        let h = half as i32;
-        launch!(self, rope_table, half, &*cos, &*sin, inv, &pos, &h);
+        self.ensure(cos, m * half)?;
+        self.ensure(sin, m * half)?;
+        let (h, m32, p) = (half as i32, m as i32, pos as f32);
+        launch!(self, rope_table, m * half, &*cos, &*sin, inv, &p, &h, &m32);
         Ok(())
     }
 
@@ -242,13 +337,25 @@ impl Ops for Cuda {
         x: At<Buf>,
         cos: &Buf,
         sin: &Buf,
+        m: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
-        self.ensure(y, heads * dh)?;
-        let (h, d) = (heads as i32, dh as i32);
-        let x = view(x, heads * dh);
-        launch!(self, rope, heads * dh / 2, &*y, &x, cos, sin, &h, &d);
+        self.ensure(y, m * heads * dh)?;
+        let (m32, h, d) = (m as i32, heads as i32, dh as i32);
+        let x = view(x, m * heads * dh);
+        launch!(
+            self,
+            rope,
+            m * heads * dh / 2,
+            &*y,
+            &x,
+            cos,
+            sin,
+            &m32,
+            &h,
+            &d
+        );
         Ok(())
     }
 
@@ -260,28 +367,29 @@ impl Ops for Cuda {
         Ok(())
     }
 
-    fn gla_update(
+    fn gla(
         &self,
+        y: &mut Buf,
         s: &mut Buf,
+        q: At<Buf>,
         k: At<Buf>,
         v: At<Buf>,
         decay: &Buf,
         bias: &Buf,
+        m: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
-        let (h, d) = (heads as i32, dh as i32);
-        let n = heads * dh;
-        let (k, v) = (view(k, n), view(v, n));
-        launch!(self, gla_update, n * dh, &*s, &k, &v, decay, bias, &h, &d);
-        Ok(())
-    }
-
-    fn gla_read(&self, y: &mut Buf, q: At<Buf>, s: &Buf, heads: usize, dh: usize) -> Result<()> {
-        self.ensure(y, heads * dh)?;
-        let (h, d) = (heads as i32, dh as i32);
-        let q = view(q, heads * dh);
-        launch!(self, gla_read, heads * dh, &*y, &q, s, &h, &d);
+        self.ensure(y, m * heads * dh)?;
+        let (m32, h, d) = (m as i32, heads as i32, dh as i32);
+        let c = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (GLA_THREADS.min(dh as u32), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = m * heads * dh;
+        let (q, k, v) = (view(q, n), view(k, n), view(v, n));
+        launch!(@go self, gla, c, &*y, &*s, &q, &k, &v, decay, bias, &m32, &h, &d);
         Ok(())
     }
 
@@ -289,14 +397,26 @@ impl Ops for Cuda {
         &self,
         cache: &mut Buf,
         src: At<Buf>,
-        slot: usize,
+        pos: usize,
+        m: usize,
         cap: usize,
         heads: usize,
         dh: usize,
     ) -> Result<()> {
-        let (sl, c, h, d) = (slot as i32, cap as i32, heads as i32, dh as i32);
-        let src = view(src, heads * dh);
-        launch!(self, store, heads * dh, &*cache, &src, &sl, &c, &h, &d);
+        let (p, m32, c, h, d) = (pos as i32, m as i32, cap as i32, heads as i32, dh as i32);
+        let src = view(src, m * heads * dh);
+        launch!(
+            self,
+            store,
+            m * heads * dh,
+            &*cache,
+            &src,
+            &p,
+            &m32,
+            &c,
+            &h,
+            &d
+        );
         Ok(())
     }
 
@@ -309,26 +429,64 @@ impl Ops for Cuda {
         v: &Buf,
         a: Attn,
     ) -> Result<()> {
-        let p = ATTEND_SLICES.min(a.n);
-        let aux_len = a.heads * p * (2 + a.dh);
-        let at = a.heads * a.cap;
-        self.ensure(y, a.heads * a.dh)?;
-        self.ensure(scores, at + a.heads * ATTEND_SLICES * (2 + a.dh))?;
-        let (n, cap, h, kh, d, pi) = (
-            a.n as i32,
+        if a.dh > MAX_DH {
+            bail!("head size {} is above the {MAX_DH} the kernels allow", a.dh);
+        }
+        let span = a.span();
+        let pairs = a.heads * a.m;
+        let slices = (ATTEND_THREADS / a.m).clamp(1, span);
+        let at = pairs * span;
+        self.ensure(y, pairs * a.dh)?;
+        self.ensure(scores, at + pairs * slices * (2 + a.dh))?;
+        let (pos, m, reach, gap) = (
+            a.pos as i32,
+            a.m as i32,
+            a.reach.min(i32::MAX as usize) as i32,
+            a.gap as i32,
+        );
+        let (sp, cap, h, kh, d, p) = (
+            span as i32,
             a.cap as i32,
             a.heads as i32,
             a.key_heads as i32,
             a.dh as i32,
-            p as i32,
+            slices as i32,
         );
-        let q = view(q, a.heads * a.dh);
-        let (sc, aux) = (scores.slice(..at), scores.slice(at..at + aux_len));
-        let threads = a.heads * p;
-        launch!(self, attn_score, threads, &sc, &aux, &q, k, &n, &cap, &h, &kh, &d, &pi, &a.scale);
-        launch!(self, attn_exp, threads, &sc, &aux, &n, &h, &pi);
-        launch!(self, attn_sum, threads, &sc, &aux, v, &n, &cap, &h, &kh, &d, &pi);
-        launch!(self, attn_join, a.heads * a.dh, &*y, &aux, &h, &d, &pi);
+        let (sc, aux) = (scores.slice(..at), scores.slice(at..));
+        let threads = pairs * slices;
+        let q = view(q, pairs * a.dh);
+        launch!(
+            self, attn_score, threads, &sc, &aux, &q, k, &pos, &m, &reach, &gap, &sp, &cap, &h,
+            &kh, &d, &p, &a.scale
+        );
+        launch!(self, attn_exp, threads, &sc, &aux, &pos, &m, &reach, &gap, &sp, &h, &p);
+        if a.m < BLOCK {
+            launch!(
+                self, attn_part, threads, &sc, &aux, v, &pos, &m, &reach, &gap, &sp, &cap, &h, &kh,
+                &d, &p
+            );
+            launch!(self, attn_join, pairs * a.dh, &*y, &aux, &m, &h, &d, &p);
+        } else {
+            launch!(
+                self,
+                attn_sum,
+                pairs * a.dh,
+                &*y,
+                &sc,
+                &aux,
+                v,
+                &pos,
+                &m,
+                &reach,
+                &gap,
+                &sp,
+                &cap,
+                &h,
+                &kh,
+                &d,
+                &p
+            );
+        }
         Ok(())
     }
 }
