@@ -1,0 +1,43 @@
+[package]
+name = "slm"
+version = "0.1.0"
+edition = "2021"
+description = "Run Looped Hybrid Reasoner language models locally with CUDA, MLX or the CPU"
+repository = "https://github.com/integemjack/SLM.use"
+default-run = "slm"
+
+[lib]
+name = "slm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "slm"
+path = "src/main.rs"
+
+[features]
+default = []
+# The runtime only needs the NVIDIA driver: kernels ship as PTX inside the binary.
+cuda = ["dep:cudarc"]
+mlx = ["dep:mlx-rs"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+multiversion = "0.8"
+rayon = "1"
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"], optional = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = { version = "0.34", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-22.04, features: cuda }
+          - { name: linux-arm64, os: ubuntu-22.04-arm, features: cuda }
+          - { name: windows-x64, os: windows-latest, features: cuda }
+          - { name: windows-arm64, os: windows-11-arm, features: "" }
+          - { name: macos-arm64, os: macos-14, features: mlx }
+          - { name: macos-x64, os: macos-15-intel, features: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        shell: bash
+        run: cargo test --release --features "${{ matrix.features }}"
+      - name: Build
+        shell: bash
+        run: cargo build --release --features "${{ matrix.features }}"
+      - name: Package
+        shell: bash
+        run: |
+          dir="slm-${{ matrix.name }}"
+          mkdir -p "$dir/tools"
+          cp README.md "$dir/"
+          cp tools/convert.py "$dir/tools/"
+          if [ "$RUNNER_OS" = Windows ]; then cp target/release/slm.exe "$dir/"; else cp target/release/slm "$dir/"; fi
+          # MLX loads its Metal shaders from a file next to the binary.
+          if [ "${{ matrix.features }}" = mlx ]; then
+            cp "$(find target/release/build -name mlx.metallib | head -1)" "$dir/"
+          fi
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$dir.zip" "$dir"; else tar czf "$dir.tar.gz" "$dir"; fi
+      - name: Run the packaged binary
+        shell: bash
+        run: |
+          "./slm-${{ matrix.name }}/slm" --version
+          "./slm-${{ matrix.name }}/slm" verify -m tests/fixtures/tiny
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slm-${{ matrix.name }}
+          path: |
+            slm-${{ matrix.name }}.zip
+            slm-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
